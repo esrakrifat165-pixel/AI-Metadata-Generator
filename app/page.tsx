@@ -28,6 +28,29 @@ type MetadataResult = {
   model?: string;
 };
 
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result !== "string") {
+        reject(new Error("Could not read the selected file."));
+        return;
+      }
+
+      const commaIndex = result.indexOf(",");
+      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+
+    reader.onerror = () => {
+      reject(reader.error || new Error("Could not read the selected file."));
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
 export default function Home() {
   const [mode, setMode] = useState<Mode>("metadata");
   const [files, setFiles] = useState<File[]>([]);
@@ -113,44 +136,9 @@ export default function Home() {
     setProjectMessage("");
   }
 
-  function fileToBase64(
-    file: File
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-
-      reader.onload = () => {
-        const value = String(reader.result);
-        const parts = value.split(",");
-
-        if (!parts[1]) {
-          reject(
-            new Error(
-              `Could not read ${file.name}`
-            )
-          );
-          return;
-        }
-
-        resolve(parts[1]);
-      };
-
-      reader.onerror = () =>
-        reject(
-          new Error(
-            `Could not read ${file.name}`
-          )
-        );
-
-      reader.readAsDataURL(file);
-    });
-  }
-
   async function generateAll() {
     if (!files.length) {
-      setGenerationError(
-        "Please upload at least one file."
-      );
+      setGenerationError("Please upload at least one file.");
       return;
     }
 
@@ -159,50 +147,45 @@ export default function Home() {
     setResults([]);
 
     try {
-      const encodedFiles = await Promise.all(
-        files.map(async (file) => ({
-          name: file.name,
-          type:
-            file.type ||
-            (file.name
-              .toLowerCase()
-              .endsWith(".eps")
-              ? "application/postscript"
-              : "image/jpeg"),
-          data: await fileToBase64(file),
-        }))
-      );
+      const generatedResults: MetadataResult[] = [];
 
-      const response = await fetch(
-        "/api/generate-metadata",
-        {
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append("file", file, file.name);
+        formData.append("platform", platform);
+        formData.append("provider", provider);
+        formData.append("titleLength", String(titleLength));
+        formData.append("keywordCount", String(keywordCount));
+
+        const response = await fetch("/api/generate-metadata", {
           method: "POST",
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
-          body: JSON.stringify({
-            files: encodedFiles,
-            settings: {
-              platform,
-              provider,
-              titleLength,
-              keywordCount,
-            },
-          }),
+          body: formData,
+        });
+
+        const raw = await response.text();
+        let data: any = null;
+
+        try {
+          data = raw ? JSON.parse(raw) : null;
+        } catch {
+          throw new Error(
+            response.status === 413
+              ? `${file.name}: File is too large for the current Vercel upload limit. Please use a file under 4 MB.`
+              : `${file.name}: Server returned a non-JSON error (${response.status}).`
+          );
         }
-      );
 
-      const data = await response.json();
+        if (!response.ok || !data?.success) {
+          throw new Error(
+            `${file.name}: ${data?.message || "Metadata generation failed."}`
+          );
+        }
 
-      if (!response.ok || !data.success) {
-        throw new Error(
-          data?.message ||
-            "Metadata generation failed."
-        );
+        if (Array.isArray(data.results)) {
+          generatedResults.push(...data.results);
+          setResults([...generatedResults]);
+        }
       }
-
-      setResults(data.results || []);
     } catch (error) {
       setGenerationError(
         error instanceof Error

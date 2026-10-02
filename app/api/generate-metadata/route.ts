@@ -526,21 +526,12 @@ async function callGemini(
       temporary &&
       attempt < maxAttempts
     ) {
-      // Exponential backoff with jitter for temporary 5xx errors.
-      const baseDelay =
-        2000 *
+      const delay =
+        1500 *
         Math.pow(
           2,
           attempt - 1
         );
-
-      const jitter =
-        Math.floor(
-          Math.random() * 750
-        );
-
-      const delay =
-        baseDelay + jitter;
 
       console.log(
         `Retrying Gemini ${model} in ${delay / 1000}s...`
@@ -948,14 +939,10 @@ async function generate(
     "gemini-3.8-flash";
 
   const geminiModels = [
-    ...new Set([
-      geminiModel,
-      "gemini-3.8-flash",
-      "gemini-3.7-flash",
-      "gemini-3.6-flash",
-      "gemini-3.5-flash",
-      "gemini-3.5-flash-lite",
-    ]),
+    geminiModel,
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
   ];
 
   const openAIModel =
@@ -1044,18 +1031,6 @@ async function generate(
               "GEMINI_AUTH_ERROR: ",
               ""
             )
-          );
-        }
-
-        // For transient 5xx/high-demand errors, callGemini has
-        // already retried once. Move to the next Gemini model.
-        if (
-          /Gemini (500|502|503|504):/.test(
-            lastError
-          )
-        ) {
-          console.log(
-            `Trying next Gemini fallback model after ${model}...`
           );
         }
       }
@@ -1204,14 +1179,65 @@ export async function POST(
   request: NextRequest
 ) {
   try {
-    const body =
-      await request.json();
+    const contentType =
+      request.headers.get("content-type") || "";
 
-    const files =
-      body?.files as ImageInput[];
+    let files: ImageInput[] = [];
+    let settings: any = {};
 
-    const settings =
-      body?.settings || {};
+    if (contentType.includes("multipart/form-data")) {
+      const form = await request.formData();
+      const uploaded = form.get("file");
+
+      if (!(uploaded instanceof File)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "No file was uploaded.",
+          },
+          { status: 400 }
+        );
+      }
+
+      const maxFileBytes = 4 * 1024 * 1024;
+
+      if (uploaded.size > maxFileBytes) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "File is too large. Please use a file under 4 MB on Vercel.",
+          },
+          { status: 413 }
+        );
+      }
+
+      const bytes = Buffer.from(
+        await uploaded.arrayBuffer()
+      );
+
+      files = [
+        {
+          name: uploaded.name || "upload",
+          type:
+            uploaded.type ||
+            (uploaded.name.toLowerCase().endsWith(".eps")
+              ? "application/postscript"
+              : "image/jpeg"),
+          data: bytes.toString("base64"),
+        },
+      ];
+
+      settings = {
+        platform: String(form.get("platform") || "General"),
+        provider: String(form.get("provider") || "auto"),
+        titleLength: Number(form.get("titleLength") || 70),
+        keywordCount: Number(form.get("keywordCount") || 50),
+      };
+    } else {
+      const body = await request.json();
+      files = body?.files as ImageInput[];
+      settings = body?.settings || {};
+    }
 
     const platform =
       settings.platform ||
