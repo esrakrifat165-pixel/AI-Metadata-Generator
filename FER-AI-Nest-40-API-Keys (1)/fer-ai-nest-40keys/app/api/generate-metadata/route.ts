@@ -5,7 +5,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { getApiKeyCandidates, getProviderKeyCount } from "../../../lib/api-keys";
+import { getProviderApiKeys, isKeyRotationError } from "../../../lib/api-keys";
 
 export const runtime = "nodejs";
 
@@ -923,268 +923,116 @@ async function generate(
   prompt: string,
   file: ImageInput
 ): Promise<Metadata> {
-  /*
-    40-KEY ROTATION
+  const geminiModel =
+    process.env.GEMINI_MODEL ||
+    "gemini-3.8-flash";
 
-    Each provider can have up to 10 API keys.
+  const geminiModels = [
+    ...new Set([
+      geminiModel,
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash",
+    ]),
+  ];
 
-    Gemini:
-      GEMINI_API_KEY
-      GEMINI_API_KEY_2 ... GEMINI_API_KEY_10
+  const openAIModel =
+    process.env.OPENAI_MODEL ||
+    "gpt-5.6";
 
-    OpenAI:
-      OPENAI_API_KEY_1 ... OPENAI_API_KEY_10
+  const claudeModel =
+    process.env.ANTHROPIC_MODEL ||
+    "claude-sonnet-5";
 
-    Claude:
-      ANTHROPIC_API_KEY_1 ... ANTHROPIC_API_KEY_10
+  const grokModel =
+    process.env.XAI_MODEL ||
+    "grok-4.6";
 
-    Grok:
-      XAI_API_KEY_1 ... XAI_API_KEY_10
+  async function withKeyRotation<T>(
+    keyProvider: "gemini" | "openai" | "claude" | "grok",
+    fn: (apiKey: string) => Promise<T>
+  ): Promise<T> {
+    const keys = getProviderApiKeys(keyProvider);
 
-    If the current key fails, the next configured key is tried.
-  */
+    if (!keys.length) {
+      const names = {
+        gemini: "GEMINI_API_KEY_1..10",
+        openai: "OPENAI_API_KEY_1..10",
+        claude: "ANTHROPIC_API_KEY_1..10",
+        grok: "XAI_API_KEY_1..10",
+      } as const;
+      throw new Error(`${names[keyProvider]} is missing in .env.local.`);
+    }
 
-  const candidates = getApiKeyCandidates(
-    provider as Exclude<Provider, "auto">
-  );
+    let lastError: unknown = null;
 
-  if (!candidates.length) {
-    throw new Error(
-      `${provider.toUpperCase()} API key is not configured.`
-    );
+    for (let index = 0; index < keys.length; index++) {
+      const key = keys[index];
+
+      try {
+        console.log(`${keyProvider}: using API key ${index + 1}/${keys.length}`);
+        return await fn(key);
+      } catch (error) {
+        lastError = error;
+        const message = error instanceof Error ? error.message : String(error);
+
+        if (isKeyRotationError(error) && index < keys.length - 1) {
+          console.warn(`${keyProvider}: key ${index + 1} failed; rotating to key ${index + 2}.`);
+          continue;
+        }
+
+        throw new Error(message);
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error("All configured API keys failed.");
   }
 
-  console.log(
-    `${provider}: ${getProviderKeyCount(
-      provider as Exclude<Provider, "auto">
-    )} API key(s) configured.`
-  );
-
-  /* ---------------- GEMINI ---------------- */
-
   if (provider === "gemini") {
-    const geminiModel =
-      process.env.GEMINI_MODEL ||
-      "gemini-3.8-flash";
-
-    const geminiModels = Array.from(
-      new Set([
-        geminiModel,
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-      ])
-    );
-
-    let lastError = "All Gemini API keys failed.";
-
-    for (const keyInfo of candidates) {
-      console.log(
-        `Trying Gemini Key ${keyInfo.index}...`
-      );
+    return withKeyRotation("gemini", async (apiKey) => {
+      let lastError = "";
 
       for (const model of geminiModels) {
         try {
-          console.log(
-            `Trying Gemini Key ${keyInfo.index} with ${model}`
-          );
-
-          const result = await callGemini(
-            keyInfo.key,
-            model,
-            prompt,
-            file
-          );
-
-          console.log(
-            `Gemini success: Key ${keyInfo.index} / ${model}`
-          );
-
-          return result;
+          console.log(`Trying Gemini model: ${model}`);
+          return await callGemini(apiKey, model, prompt, file);
         } catch (error) {
-          lastError =
-            error instanceof Error
-              ? error.message
-              : "Unknown Gemini error.";
+          lastError = error instanceof Error ? error.message : "Unknown Gemini error.";
 
-          console.error(
-            `Gemini Key ${keyInfo.index} / ${model} failed:`,
-            lastError
-          );
+          // Quota/auth errors must escape immediately so the key-rotation
+          // wrapper can move to the next Gemini key.
+          if (isKeyRotationError(error)) throw error;
 
-          /*
-            Quota/auth errors mean this key cannot be used.
-            Move immediately to the next configured key.
-          */
-          if (
-            lastError.includes("GEMINI_QUOTA_EXCEEDED") ||
-            lastError.includes("GEMINI_AUTH_ERROR")
-          ) {
-            break;
-          }
+          console.error(`Gemini ${model} failed:`, lastError);
         }
       }
 
-      console.log(
-        `Gemini Key ${keyInfo.index} unavailable. Trying next key...`
-      );
-    }
-
-    throw new Error(
-      `All configured Gemini API keys failed. Last error: ${lastError}`
-    );
+      throw new Error(`All Gemini models failed. Last error: ${lastError}`);
+    });
   }
-
-  /* ---------------- OPENAI ---------------- */
 
   if (provider === "openai") {
-    const model =
-      process.env.OPENAI_MODEL ||
-      "gpt-5.6";
-
-    let lastError = "All OpenAI API keys failed.";
-
-    for (const keyInfo of candidates) {
-      try {
-        console.log(
-          `Trying OpenAI Key ${keyInfo.index}...`
-        );
-
-        const result = await callOpenAI(
-          keyInfo.key,
-          model,
-          prompt,
-          file
-        );
-
-        console.log(
-          `OpenAI success: Key ${keyInfo.index}`
-        );
-
-        return result;
-      } catch (error) {
-        lastError =
-          error instanceof Error
-            ? error.message
-            : "Unknown OpenAI error.";
-
-        console.error(
-          `OpenAI Key ${keyInfo.index} failed:`,
-          lastError
-        );
-
-        console.log(
-          `Trying next OpenAI key...`
-        );
-      }
-    }
-
-    throw new Error(
-      `All configured OpenAI API keys failed. Last error: ${lastError}`
+    return withKeyRotation("openai", (apiKey) =>
+      callOpenAI(apiKey, openAIModel, prompt, file)
     );
   }
-
-  /* ---------------- CLAUDE ---------------- */
 
   if (provider === "claude") {
-    const model =
-      process.env.ANTHROPIC_MODEL ||
-      "claude-sonnet-5";
-
-    let lastError = "All Claude API keys failed.";
-
-    for (const keyInfo of candidates) {
-      try {
-        console.log(
-          `Trying Claude Key ${keyInfo.index}...`
-        );
-
-        const result = await callClaude(
-          keyInfo.key,
-          model,
-          prompt,
-          file
-        );
-
-        console.log(
-          `Claude success: Key ${keyInfo.index}`
-        );
-
-        return result;
-      } catch (error) {
-        lastError =
-          error instanceof Error
-            ? error.message
-            : "Unknown Claude error.";
-
-        console.error(
-          `Claude Key ${keyInfo.index} failed:`,
-          lastError
-        );
-
-        console.log(
-          `Trying next Claude key...`
-        );
-      }
-    }
-
-    throw new Error(
-      `All configured Claude API keys failed. Last error: ${lastError}`
+    return withKeyRotation("claude", (apiKey) =>
+      callClaude(apiKey, claudeModel, prompt, file)
     );
   }
-
-  /* ---------------- GROK ---------------- */
 
   if (provider === "grok") {
-    const model =
-      process.env.XAI_MODEL ||
-      "grok-4.6";
-
-    let lastError = "All Grok API keys failed.";
-
-    for (const keyInfo of candidates) {
-      try {
-        console.log(
-          `Trying Grok Key ${keyInfo.index}...`
-        );
-
-        const result = await callGrok(
-          keyInfo.key,
-          model,
-          prompt,
-          file
-        );
-
-        console.log(
-          `Grok success: Key ${keyInfo.index}`
-        );
-
-        return result;
-      } catch (error) {
-        lastError =
-          error instanceof Error
-            ? error.message
-            : "Unknown Grok error.";
-
-        console.error(
-          `Grok Key ${keyInfo.index} failed:`,
-          lastError
-        );
-
-        console.log(
-          `Trying next Grok key...`
-        );
-      }
-    }
-
-    throw new Error(
-      `All configured Grok API keys failed. Last error: ${lastError}`
+    return withKeyRotation("grok", (apiKey) =>
+      callGrok(apiKey, grokModel, prompt, file)
     );
   }
 
-  throw new Error(
-    `Unsupported provider: ${provider}`
-  );
+  throw new Error(`Unsupported provider: ${provider}`);
 }
 
 /* =========================================================

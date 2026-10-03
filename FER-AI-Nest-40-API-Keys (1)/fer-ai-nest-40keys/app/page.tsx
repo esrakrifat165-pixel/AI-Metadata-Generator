@@ -16,7 +16,6 @@ type PromptResult = {
   prompt: string;
   provider?: string;
   model?: string;
-  sourceIndex?: number;
 };
 
 type MetadataResult = {
@@ -28,6 +27,16 @@ type MetadataResult = {
   provider?: string;
   model?: string;
 };
+
+type ApiKeyProvider = "gemini" | "openai" | "claude" | "grok";
+
+type ApiKeySlot = {
+  index: number;
+  configured: boolean;
+  key: string;
+};
+
+type ApiKeyState = Record<ApiKeyProvider, ApiKeySlot[]>;
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -97,12 +106,24 @@ export default function Home() {
   const [testingApi, setTestingApi] =
     useState(false);
 
-  const [apiKeys, setApiKeys] = useState<Record<string, Array<{ index: number; label: string; maskedKey: string }>>>({});
-  const [apiKeyInputs, setApiKeyInputs] = useState<Record<string, string>>({});
-  const [apiKeyLoading, setApiKeyLoading] = useState(false);
-  const [apiKeySaving, setApiKeySaving] = useState<string | null>(null);
-  const [apiKeyMessage, setApiKeyMessage] = useState("");
-  const [visibleApiKeys, setVisibleApiKeys] = useState<Record<string, boolean>>({});
+  const [apiKeys, setApiKeys] = useState<ApiKeyState>({
+    gemini: [],
+    openai: [],
+    claude: [],
+    grok: [],
+  });
+
+  const [apiKeyProvider, setApiKeyProvider] =
+    useState<ApiKeyProvider>("gemini");
+
+  const [apiKeyInputs, setApiKeyInputs] =
+    useState<Record<string, string>>({});
+
+  const [apiKeysLoading, setApiKeysLoading] =
+    useState(false);
+
+  const [apiKeySaving, setApiKeySaving] =
+    useState(false);
 
   const [projectMessage, setProjectMessage] =
     useState("");
@@ -215,179 +236,115 @@ export default function Home() {
       return;
     }
 
-    const MAX_PROMPT_FILES = 100;
-    const BATCH_SIZE = 2;
-    const MAX_RETRIES = 2;
-    const totalFiles = Math.min(files.length, MAX_PROMPT_FILES);
+    const BATCH_SIZE = 1;
 
     setGenerating(true);
     setGenerationError("");
     setPromptResults([]);
     setResults([]);
-    setPromptProgress({ completed: 0, total: totalFiles });
+    setPromptProgress({ completed: 0, total: files.length });
 
     try {
       const allResults: PromptResult[] = [];
       const failedFiles: string[] = [];
 
-      const sleep = (ms: number) =>
-        new Promise((resolve) => setTimeout(resolve, ms));
-
-      const encodeFile = async (file: File) => ({
-        name: file.name,
-        type:
-          file.type ||
-          (file.name.toLowerCase().endsWith(".eps")
-            ? "application/postscript"
-            : "image/jpeg"),
-        data: await fileToBase64(file),
-      });
-
-      const requestBatch = async (
-        batch: File[],
-        batchStartIndex: number
-      ): Promise<PromptResult[]> => {
-        const encodedFiles = await Promise.all(batch.map(encodeFile));
-        let lastError = "Image prompt generation failed.";
-
-        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-          try {
-            const response = await fetch("/api/generate-prompt", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                files: encodedFiles,
-                settings: { provider, promptType, promptDetail },
-              }),
-            });
-
-            const raw = await response.text();
-            let data: any = null;
-            try {
-              data = raw ? JSON.parse(raw) : null;
-            } catch {
-              lastError =
-                response.status === 413
-                  ? "Request is too large."
-                  : `Server returned a non-JSON error (${response.status}).`;
-            }
-
-            if (response.ok && data?.success && Array.isArray(data.results)) {
-              return data.results.map((item: PromptResult, resultIndex: number) => ({
-                ...item,
-                sourceIndex: batchStartIndex + resultIndex,
-              }));
-            }
-
-            if (response.status === 413) throw new Error("PAYLOAD_TOO_LARGE");
-
-            if (response.status === 429) {
-              throw new Error(
-                data?.message ||
-                  "Gemini quota/rate limit was exceeded. The configured API keys were exhausted."
-              );
-            }
-
-            lastError = data?.message || lastError || "Image prompt generation failed.";
-
-            const retryable = [408, 425, 500, 502, 503, 504].includes(response.status);
-            if (!retryable || attempt >= MAX_RETRIES) throw new Error(lastError);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : "Image prompt generation failed.";
-            if (message === "PAYLOAD_TOO_LARGE") throw error;
-            lastError = message;
-
-            if (
-              message.toLowerCase().includes("quota") ||
-              message.toLowerCase().includes("rate limit") ||
-              message.toLowerCase().includes("401") ||
-              message.toLowerCase().includes("403") ||
-              attempt >= MAX_RETRIES
-            ) {
-              throw new Error(lastError);
-            }
-          }
-
-          await sleep(1000 * (attempt + 1));
-        }
-
-        throw new Error(lastError);
-      };
-
-      for (let start = 0; start < totalFiles; start += BATCH_SIZE) {
-        const batch = files.slice(start, Math.min(start + BATCH_SIZE, totalFiles));
-        let batchResults: PromptResult[] = [];
+      for (let start = 0; start < files.length; start += BATCH_SIZE) {
+        const batch = files.slice(start, start + BATCH_SIZE);
 
         try {
-          batchResults = await requestBatch(batch, start);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : "Image prompt generation failed.";
+          const encodedFiles = await Promise.all(
+            batch.map(async (file) => ({
+              name: file.name,
+              type:
+                file.type ||
+                (file.name.toLowerCase().endsWith(".eps")
+                  ? "application/postscript"
+                  : "image/jpeg"),
+              data: await fileToBase64(file),
+            }))
+          );
 
-          if (message === "PAYLOAD_TOO_LARGE" && batch.length > 1) {
-            for (let i = 0; i < batch.length; i++) {
-              const singleFile = batch[i];
-              try {
-                const singleResults = await requestBatch([singleFile], start + i);
-                batchResults.push(...singleResults);
-              } catch (singleError) {
-                failedFiles.push(
-                  `${singleFile.name}: ${singleError instanceof Error ? singleError.message : "Prompt generation failed."}`
-                );
-              } finally {
-                setPromptProgress((old) => ({
-                  ...old,
-                  completed: Math.min(old.completed + 1, totalFiles),
-                }));
-              }
-            }
+          const response = await fetch("/api/generate-prompt", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              files: encodedFiles,
+              settings: {
+                provider,
+                promptType,
+                promptDetail,
+              },
+            }),
+          });
 
-            if (batchResults.length) {
-              allResults.push(...batchResults);
-              allResults.sort((a, b) => (a.sourceIndex ?? 0) - (b.sourceIndex ?? 0));
-              setPromptResults([...allResults]);
-            }
-            continue;
+          const raw = await response.text();
+          let data: any = null;
+
+          try {
+            data = raw ? JSON.parse(raw) : null;
+          } catch {
+            throw new Error(
+              response.status === 413
+                ? "This batch is too large for the server. The app will continue with the remaining files."
+                : `Server returned a non-JSON error (${response.status}).`
+            );
           }
 
-          batch.forEach((file) => failedFiles.push(`${file.name}: ${message}`));
-        }
+          if (!response.ok || !data?.success) {
+            throw new Error(
+              data?.message || "Image prompt generation failed."
+            );
+          }
 
-        if (batchResults.length) {
-          allResults.push(...batchResults);
-          allResults.sort((a, b) => (a.sourceIndex ?? 0) - (b.sourceIndex ?? 0));
-          setPromptResults([...allResults]);
-        }
+          if (Array.isArray(data.results)) {
+            allResults.push(...data.results);
+            setPromptResults([...allResults]);
+          }
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Image prompt generation failed.";
 
-        setPromptProgress((old) => ({
-          ...old,
-          completed: Math.min(old.completed + batch.length, totalFiles),
-        }));
+          batch.forEach((file) => {
+            failedFiles.push(`${file.name}: ${message}`);
+          });
+        } finally {
+          setPromptProgress((old) => ({
+            ...old,
+            completed: Math.min(old.completed + batch.length, files.length),
+          }));
+        }
       }
 
-      if (!allResults.length && failedFiles.length) throw new Error(failedFiles[0]);
+      if (!allResults.length && failedFiles.length) {
+        throw new Error(failedFiles[0]);
+      }
 
       if (failedFiles.length) {
         setGenerationError(
-          `${allResults.length} image(s) completed. ${failedFiles.length} image(s) failed. You can use Regenerate on completed items or try the failed files again.`
+          `${allResults.length} image(s) completed. ${failedFiles.length} image(s) failed. You can regenerate failed items individually.`
         );
       }
     } catch (error) {
-      setGenerationError(error instanceof Error ? error.message : "Image prompt generation failed.");
+      setGenerationError(
+        error instanceof Error
+          ? error.message
+          : "Image prompt generation failed."
+      );
     } finally {
       setGenerating(false);
     }
   }
 
   async function regeneratePrompt(index: number) {
-    const result = promptResults[index];
-    const sourceIndex = result?.sourceIndex ?? index;
-    if (!files[sourceIndex]) return;
+    if (!files[index]) return;
 
     setGenerating(true);
     setGenerationError("");
 
     try {
-      const file = files[sourceIndex];
+      const file = files[index];
       const encoded = {
         name: file.name,
         type:
@@ -412,12 +369,7 @@ export default function Home() {
         throw new Error(data?.message || "Prompt regeneration failed.");
       }
 
-      const next = {
-        ...(data.results[0] as PromptResult),
-        sourceIndex:
-          (data.results[0] as PromptResult).sourceIndex ?? sourceIndex,
-      };
-
+      const next = data.results[0] as PromptResult;
       setPromptResults((old) =>
         old.map((item, i) => (i === index ? next : item))
       );
@@ -688,89 +640,110 @@ export default function Home() {
     setProjectMessage("");
   }
 
-  const providerLabels: Record<string, string> = {
-    gemini: "Gemini",
-    openai: "OpenAI / ChatGPT",
-    claude: "Claude",
-    grok: "Grok",
-  };
-
   async function loadApiKeys() {
-    setApiKeyLoading(true);
-    setApiKeyMessage("");
+    setApiKeysLoading(true);
 
     try {
-      const response = await fetch("/api/api-settings", { cache: "no-store" });
+      const response = await fetch("/api/api-settings", {
+        cache: "no-store",
+      });
       const data = await response.json();
+
       if (!response.ok || !data.success) {
         throw new Error(data?.message || "Could not load API keys.");
       }
-      setApiKeys(data.keys || {});
+
+      setApiKeys(data.providers);
     } catch (error) {
-      setApiKeyMessage(error instanceof Error ? error.message : "Could not load API keys.");
+      setApiStatus(
+        error instanceof Error ? error.message : "Could not load API keys."
+      );
     } finally {
-      setApiKeyLoading(false);
+      setApiKeysLoading(false);
     }
   }
 
-  async function saveApiKey(providerName: string, index: number) {
-    const inputKey = `${providerName}:${index}`;
-    const apiKey = (apiKeyInputs[inputKey] || "").trim();
+  async function openApiModal() {
+    setShowApiModal(true);
+    setApiStatus("");
+    await loadApiKeys();
+  }
 
-    if (!apiKey) {
-      setApiKeyMessage(`Enter the ${providerLabels[providerName] || providerName} Key ${index}.`);
+  async function saveApiKey(slot: number) {
+    const value = (apiKeyInputs[`${apiKeyProvider}-${slot}`] || "").trim();
+
+    if (!value) {
+      setApiStatus("Please enter an API key first.");
       return;
     }
 
-    setApiKeySaving(inputKey);
-    setApiKeyMessage("");
+    setApiKeySaving(true);
+    setApiStatus("");
 
     try {
       const response = await fetch("/api/api-settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: providerName, index, apiKey }),
+        body: JSON.stringify({
+          provider: apiKeyProvider,
+          slot,
+          apiKey: value,
+        }),
       });
+
       const data = await response.json();
+
       if (!response.ok || !data.success) {
         throw new Error(data?.message || "Could not save API key.");
       }
-      setApiKeyInputs((old) => ({ ...old, [inputKey]: "" }));
-      setApiKeyMessage(`${providerLabels[providerName]} Key ${index} saved successfully.`);
+
+      setApiKeyInputs((old) => ({
+        ...old,
+        [`${apiKeyProvider}-${slot}`]: "",
+      }));
+
+      setApiStatus(data.message || "API key saved successfully.");
       await loadApiKeys();
     } catch (error) {
-      setApiKeyMessage(error instanceof Error ? error.message : "Could not save API key.");
+      setApiStatus(
+        error instanceof Error ? error.message : "Could not save API key."
+      );
     } finally {
-      setApiKeySaving(null);
+      setApiKeySaving(false);
     }
   }
 
-  async function removeApiKey(providerName: string, index: number) {
-    setApiKeySaving(`${providerName}:${index}`);
-    setApiKeyMessage("");
+  async function removeApiKey(slot: number) {
+    if (!window.confirm(`Remove ${apiKeyProvider} API key ${slot}?`)) return;
+
+    setApiKeysLoading(true);
+    setApiStatus("");
 
     try {
       const response = await fetch("/api/api-settings", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: providerName, index }),
+        body: JSON.stringify({
+          provider: apiKeyProvider,
+          slot,
+        }),
       });
+
       const data = await response.json();
+
       if (!response.ok || !data.success) {
         throw new Error(data?.message || "Could not remove API key.");
       }
-      setApiKeyMessage(`${providerLabels[providerName]} Key ${index} removed.`);
+
+      setApiStatus(data.message || "API key removed.");
       await loadApiKeys();
     } catch (error) {
-      setApiKeyMessage(error instanceof Error ? error.message : "Could not remove API key.");
+      setApiStatus(
+        error instanceof Error ? error.message : "Could not remove API key."
+      );
     } finally {
-      setApiKeySaving(null);
+      setApiKeysLoading(false);
     }
-  }
-
-  function toggleApiKeyVisibility(providerName: string, index: number) {
-    const key = `${providerName}:${index}`;
-    setVisibleApiKeys((old) => ({ ...old, [key]: !old[key] }));
   }
 
   async function testGemini() {
@@ -778,15 +751,25 @@ export default function Home() {
     setApiStatus("");
 
     try {
-      const response = await fetch("/api/gemini-test", { method: "POST" });
+      const response = await fetch("/api/gemini-test", {
+        method: "POST",
+      });
+
       const data = await response.json();
+
       if (!response.ok || !data.success) {
-        throw new Error(data?.message || "Gemini API test failed.");
+        throw new Error(
+          data?.message || "Gemini API test failed."
+        );
       }
+
       setApiStatus("Gemini API Connected Successfully.");
-      await loadApiKeys();
     } catch (error) {
-      setApiStatus(error instanceof Error ? error.message : "Gemini API test failed.");
+      setApiStatus(
+        error instanceof Error
+          ? error.message
+          : "Gemini API test failed."
+      );
     } finally {
       setTestingApi(false);
     }
@@ -870,10 +853,7 @@ export default function Home() {
 
           <button
             className="apiButton"
-            onClick={() => {
-              setShowApiModal(true);
-              loadApiKeys();
-            }}
+            onClick={openApiModal}
           >
             ⚿ API Keys
           </button>
@@ -1567,99 +1547,136 @@ export default function Home() {
       {showApiModal && (
         <div
           className="modalOverlay"
-          onClick={() => setShowApiModal(false)}
+          onClick={() =>
+            setShowApiModal(false)
+          }
         >
           <div
             className="apiModal"
             onClick={(e) => e.stopPropagation()}
-            style={{ maxWidth: 900, width: "calc(100% - 32px)", maxHeight: "85vh", overflowY: "auto" }}
           >
             <div className="apiModalHeader">
-              <div>
-                <h2>AI API Keys</h2>
-                <p style={{ margin: 0, opacity: 0.7, fontSize: 13 }}>
-                  Add up to 10 keys for each provider. Keys stay on your local server in .env.local.
-                </p>
-              </div>
+              <h2>AI API Keys</h2>
               <button onClick={() => setShowApiModal(false)}>×</button>
             </div>
 
-            {apiKeyLoading ? (
+            <p>
+              Add up to <b>10 API keys per provider</b>. Keys stay server-side.
+            </p>
+
+            <div className="apiInfo">
+              <strong>Automatic key rotation</strong>
+              <p>
+                If a key returns a quota, rate-limit, or authentication error,
+                FER AI Nest automatically tries the next configured key.
+              </p>
+            </div>
+
+            <div className="platformGrid">
+              {([
+                ["gemini", "Gemini"],
+                ["openai", "OpenAI / ChatGPT"],
+                ["claude", "Claude"],
+                ["grok", "Grok"],
+              ] as [ApiKeyProvider, string][]).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={apiKeyProvider === value ? "platform active" : "platform"}
+                  onClick={() => setApiKeyProvider(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
+            {apiKeysLoading ? (
               <div className="apiStatus">Loading API keys...</div>
             ) : (
-              <div style={{ display: "grid", gap: 18, marginTop: 16 }}>
-                {(["gemini", "openai", "claude", "grok"] as const).map((providerName) => {
-                  const configured = apiKeys[providerName] || [];
-                  const configuredMap = new Map(configured.map((item) => [item.index, item]));
+              <div style={{ marginTop: 14, maxHeight: 430, overflowY: "auto" }}>
+                {(apiKeys[apiKeyProvider] || []).map((slot) => (
+                  <div
+                    key={slot.index}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "58px 1fr auto",
+                      gap: 8,
+                      alignItems: "center",
+                      marginBottom: 8,
+                    }}
+                  >
+                    <span style={{ fontSize: 13 }}>Key {slot.index}</span>
 
-                  return (
-                    <div key={providerName} className="apiInfo" style={{ padding: 16 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "center" }}>
-                        <strong>{providerLabels[providerName]}</strong>
-                        <span style={{ fontSize: 12, opacity: 0.7 }}>{configured.length}/10 configured</span>
-                      </div>
+                    <input
+                      type="password"
+                      placeholder={slot.configured ? slot.key : "Paste API key"}
+                      value={apiKeyInputs[`${apiKeyProvider}-${slot.index}`] || ""}
+                      onChange={(e) =>
+                        setApiKeyInputs((old) => ({
+                          ...old,
+                          [`${apiKeyProvider}-${slot.index}`]: e.target.value,
+                        }))
+                      }
+                      style={{
+                        width: "100%",
+                        minWidth: 0,
+                        padding: "10px 12px",
+                        borderRadius: 8,
+                        border: "1px solid rgba(255,255,255,.12)",
+                        background: "rgba(255,255,255,.04)",
+                        color: "inherit",
+                      }}
+                    />
 
-                      <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
-                        {Array.from({ length: 10 }, (_, i) => i + 1).map((index) => {
-                          const item = configuredMap.get(index);
-                          const inputId = `${providerName}:${index}`;
-                          const visible = Boolean(visibleApiKeys[inputId]);
-                          const saving = apiKeySaving === inputId;
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button
+                        type="button"
+                        className="actionButton"
+                        disabled={apiKeySaving}
+                        onClick={() => saveApiKey(slot.index)}
+                      >
+                        {slot.configured ? "Update" : "Save"}
+                      </button>
 
-                          return (
-                            <div key={inputId} style={{ display: "grid", gridTemplateColumns: "100px 1fr auto auto", gap: 8, alignItems: "center" }}>
-                              <span style={{ fontSize: 13, fontWeight: 600 }}>Key {index}</span>
-                              <input
-                                className="editableInput"
-                                type={visible ? "text" : "password"}
-                                placeholder={item ? item.maskedKey : `Enter ${providerLabels[providerName]} Key ${index}`}
-                                value={apiKeyInputs[inputId] || ""}
-                                onChange={(e) => setApiKeyInputs((old) => ({ ...old, [inputId]: e.target.value }))}
-                                autoComplete="off"
-                              />
-                              <button type="button" className="actionButton" onClick={() => toggleApiKeyVisibility(providerName, index)}>
-                                {visible ? "Hide" : "Show"}
-                              </button>
-                              <div style={{ display: "flex", gap: 6 }}>
-                                <button type="button" className="actionButton" disabled={saving} onClick={() => saveApiKey(providerName, index)}>
-                                  {saving ? "Saving..." : item ? "Update" : "Save"}
-                                </button>
-                                {item && (
-                                  <button type="button" className="clearButton" disabled={saving} onClick={() => removeApiKey(providerName, index)}>
-                                    Remove
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+                      {slot.configured && (
+                        <button
+                          type="button"
+                          className="clearButton"
+                          onClick={() => removeApiKey(slot.index)}
+                        >
+                          Remove
+                        </button>
+                      )}
                     </div>
-                  );
-                })}
+                  </div>
+                ))}
               </div>
             )}
 
-            {apiKeyMessage && (
-              <div className="apiStatus" style={{ marginTop: 14 }}>
-                {apiKeyMessage}
-              </div>
-            )}
+            {apiStatus && <div className="apiStatus">{apiStatus}</div>}
 
-            <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
-              <button className="actionButton" onClick={loadApiKeys} disabled={apiKeyLoading}>
-                Refresh Keys
-              </button>
-              <button className="generateButton" onClick={testGemini} disabled={testingApi}>
+            <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+              <button
+                className="generateButton"
+                onClick={testGemini}
+                disabled={testingApi}
+              >
                 {testingApi ? "Testing..." : "Test Gemini API"}
+              </button>
+
+              <button
+                className="actionButton"
+                onClick={loadApiKeys}
+                disabled={apiKeysLoading}
+              >
+                Refresh Keys
               </button>
             </div>
 
-            {apiStatus && (
-              <div className="apiStatus" style={{ marginTop: 10 }}>
-                {apiStatus}
-              </div>
-            )}
+            <p style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
+              Local development: keys are saved in .env.local. For Vercel production,
+              add the numbered variables in Project Settings → Environment Variables.
+            </p>
           </div>
         </div>
       )}

@@ -4,7 +4,7 @@ import os from "os";
 import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
-import { getApiKeyCandidates } from "../../../lib/api-keys";
+import { getProviderApiKeys, isKeyRotationError } from "../../../lib/api-keys";
 
 export const runtime = "nodejs";
 
@@ -42,6 +42,14 @@ const GEMINI_MODELS = [
   "gemini-3.6-flash",
   "gemini-3.5-flash",
 ];
+
+/* =========================================================
+   GEMINI API KEY
+========================================================= */
+
+function getGeminiApiKey(): string {
+  return getProviderApiKeys("gemini")[0] || "";
+}
 
 /* =========================================================
    CLEAN GENERATED PROMPT
@@ -582,6 +590,11 @@ async function requestGemini(
   promptType: string,
   promptDetail: string
 ): Promise<GeminiResult> {
+  if (!apiKey) {
+    throw new Error(
+      "Gemini API key is not configured. Please add a Gemini API key from API Settings."
+    );
+  }
 
   const {
     data,
@@ -732,156 +745,205 @@ async function requestGemini(
 ========================================================= */
 
 async function callGemini(
+  apiKey: string,
   file: ImageInput,
   promptType: string,
   promptDetail: string
 ): Promise<GeminiResult> {
-  const keys = getApiKeyCandidates("gemini");
-
-  if (!keys.length) {
-    throw new Error(
-      "Gemini API key is not configured. Add a Gemini key from API Settings."
-    );
-  }
-
   let lastError: Error | null = null;
 
-  /*
-    Key rotation + model fallback:
+  for (let index = 0; index < GEMINI_MODELS.length; index++) {
+    const model = GEMINI_MODELS[index];
 
-    Key 1
-      -> model 1
-      -> model 2
-      -> model 3
-      -> model 4
+    try {
+      console.log(`Image Prompt: trying Gemini ${model} for ${file.name}`);
+      return await requestGemini(apiKey, file, model, promptType, promptDetail);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("Unknown Gemini error.");
+      const status = (lastError as Error & { status?: number }).status;
 
-    Key 2
-      -> model 1
-      -> model 2
-      -> model 3
-      -> model 4
+      console.error(`Image Prompt: Gemini ${model} failed for ${file.name}:`, lastError.message);
 
-    ...
-
-    Key 10
-      -> model 1
-      -> model 2
-      -> model 3
-      -> model 4
-  */
-  for (const keyInfo of keys) {
-    let moveToNextKey = false;
-
-    for (const model of GEMINI_MODELS) {
-      try {
-        console.log(
-          `Image Prompt: trying ${keyInfo.label} with ${model} for ${file.name}`
-        );
-
-        const result = await requestGemini(
-          keyInfo.key,
-          file,
-          model,
-          promptType,
-          promptDetail
-        );
-
-        console.log(
-          `Image Prompt: success using ${keyInfo.label} / ${model} for ${file.name}`
-        );
-
-        return result;
-      } catch (error) {
-        lastError =
-          error instanceof Error
-            ? error
-            : new Error("Unknown Gemini error.");
-
-        const status =
-          (lastError as Error & {
-            status?: number;
-          }).status;
-
-        console.error(
-          `Image Prompt: ${keyInfo.label} / ${model} failed for ${file.name}:`,
-          lastError.message
-        );
-
-        /*
-          401 / 403 = invalid, disabled, or unauthorized key.
-          Stop using this key and move to the next key.
-        */
-        if (status === 401 || status === 403) {
-          console.log(
-            `Image Prompt: ${keyInfo.label} authentication failed. Moving to next key.`
-          );
-
-          moveToNextKey = true;
-          break;
-        }
-
-        /*
-          429 = quota/rate limit for this model.
-          IMPORTANT: try the next Gemini model with the SAME key first.
-        */
-        if (status === 429) {
-          console.log(
-            `Image Prompt: ${keyInfo.label} / ${model} quota exceeded. Trying next Gemini model.`
-          );
-
-          continue;
-        }
-
-        /*
-          404 = model unavailable.
-          Try the next model.
-        */
-        if (status === 404) {
-          console.log(
-            `Image Prompt: ${model} unavailable. Trying next Gemini model.`
-          );
-
-          continue;
-        }
-
-        /*
-          Temporary Gemini server errors.
-          Try the next model.
-        */
-        if (
-          status === 500 ||
-          status === 502 ||
-          status === 503 ||
-          status === 504
-        ) {
-          console.log(
-            `Image Prompt: temporary Gemini error on ${model}. Trying next model.`
-          );
-
-          continue;
-        }
-
-        /*
-          Other errors: try the next model before abandoning this key.
-        */
-        continue;
+      if (status === 401 || status === 403) {
+        throw new Error(`Gemini API key rejected: ${lastError.message}`);
       }
-    }
 
-    if (moveToNextKey) {
-      continue;
-    }
+      if (status === 429) {
+        throw new Error(`Gemini API quota exceeded: ${lastError.message}`);
+      }
 
-    console.log(
-      `Image Prompt: all Gemini models failed for ${keyInfo.label}. Moving to next key.`
-    );
+      if (status === 404 || status === 500 || status === 502 || status === 503 || status === 504) {
+        if (index < GEMINI_MODELS.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 1200 * (index + 1)));
+          continue;
+        }
+      }
+
+      if (index < GEMINI_MODELS.length - 1) continue;
+    }
   }
 
-  throw new Error(
-    `All configured Gemini API keys and Gemini models failed. Last error: ${
-      lastError?.message || "Unknown Gemini error."
-    }`
-  );
+  throw lastError || new Error("All Gemini models failed.");
+}
+
+async function callOpenAI(
+  apiKey: string,
+  model: string,
+  file: ImageInput,
+  promptType: string,
+  promptDetail: string
+): Promise<PromptResult> {
+  const prompt = buildImagePrompt(promptType, promptDetail);
+  const { data, mimeType } = normalizeImageData(file);
+
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      input: [{ role: "user", content: [
+        { type: "input_text", text: prompt },
+        { type: "input_image", image_url: `data:${mimeType};base64,${data}` },
+      ]}],
+    }),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    let message = responseText;
+    try { message = JSON.parse(responseText)?.error?.message || message; } catch {}
+    throw new Error(`OpenAI ${response.status}: ${message}`);
+  }
+
+  let body: any;
+  try { body = JSON.parse(responseText); } catch { throw new Error("OpenAI returned invalid JSON."); }
+  const generated = body?.output_text;
+  if (!generated) throw new Error("OpenAI returned no prompt.");
+
+  return { fileName: file.name, prompt: cleanGeneratedPrompt(generated), provider: "OpenAI", model };
+}
+
+async function callClaude(
+  apiKey: string,
+  model: string,
+  file: ImageInput,
+  promptType: string,
+  promptDetail: string
+): Promise<PromptResult> {
+  const prompt = buildImagePrompt(promptType, promptDetail);
+  const { data, mimeType } = normalizeImageData(file);
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: 1800,
+      messages: [{ role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mimeType, data } },
+        { type: "text", text: prompt },
+      ]}],
+    }),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    let message = responseText;
+    try { message = JSON.parse(responseText)?.error?.message || message; } catch {}
+    throw new Error(`Claude ${response.status}: ${message}`);
+  }
+
+  let body: any;
+  try { body = JSON.parse(responseText); } catch { throw new Error("Claude returned invalid JSON."); }
+  const generated = body?.content?.find((item: any) => item?.type === "text")?.text;
+  if (!generated) throw new Error("Claude returned no prompt.");
+
+  return { fileName: file.name, prompt: cleanGeneratedPrompt(generated), provider: "Claude", model };
+}
+
+async function callGrok(
+  apiKey: string,
+  model: string,
+  file: ImageInput,
+  promptType: string,
+  promptDetail: string
+): Promise<PromptResult> {
+  const prompt = buildImagePrompt(promptType, promptDetail);
+  const { data, mimeType } = normalizeImageData(file);
+
+  const response = await fetch("https://api.x.ai/v1/responses", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+    body: JSON.stringify({
+      model,
+      input: [{ role: "user", content: [
+        { type: "input_image", image_url: `data:${mimeType};base64,${data}` },
+        { type: "input_text", text: prompt },
+      ]}],
+    }),
+  });
+
+  const responseText = await response.text();
+  if (!response.ok) {
+    let message = responseText;
+    try { message = JSON.parse(responseText)?.error?.message || message; } catch {}
+    throw new Error(`Grok ${response.status}: ${message}`);
+  }
+
+  let body: any;
+  try { body = JSON.parse(responseText); } catch { throw new Error("Grok returned invalid JSON."); }
+  const generated = body?.output_text;
+  if (!generated) throw new Error("Grok returned no prompt.");
+
+  return { fileName: file.name, prompt: cleanGeneratedPrompt(generated), provider: "Grok", model };
+}
+
+async function generatePromptWithProvider(
+  provider: "gemini" | "openai" | "claude" | "grok" | "auto",
+  file: ImageInput,
+  promptType: string,
+  promptDetail: string
+): Promise<PromptResult> {
+  const models = {
+    openai: process.env.OPENAI_MODEL || "gpt-5.6",
+    claude: process.env.ANTHROPIC_MODEL || "claude-sonnet-5",
+    grok: process.env.XAI_MODEL || "grok-4.6",
+  } as const;
+
+  const providers = provider === "auto" ? ["gemini", "openai", "claude", "grok"] as const : [provider];
+  let lastError: unknown = null;
+
+  for (const current of providers) {
+    const keys = getProviderApiKeys(current);
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        const key = keys[i];
+        console.log(`Image Prompt: ${current} key ${i + 1}/${keys.length}`);
+
+        if (current === "gemini") {
+          const result = await callGemini(key, file, promptType, promptDetail);
+          return { fileName: file.name, prompt: result.prompt, provider: "Gemini", model: result.model };
+        }
+        if (current === "openai") return await callOpenAI(key, models.openai, file, promptType, promptDetail);
+        if (current === "claude") return await callClaude(key, models.claude, file, promptType, promptDetail);
+        return await callGrok(key, models.grok, file, promptType, promptDetail);
+      } catch (error) {
+        lastError = error;
+        if (isKeyRotationError(error) && i < keys.length - 1) {
+          console.warn(`Image Prompt: rotating ${current} key ${i + 1} → ${i + 2}`);
+          continue;
+        }
+        if (provider === "auto" && isKeyRotationError(error)) break;
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("No configured AI provider/key succeeded.");
 }
 
 /* =========================================================
@@ -1022,32 +1084,21 @@ export async function POST(
         }
 
         /* -----------------------------------------
-           GEMINI IMAGE ANALYSIS
+           AI IMAGE ANALYSIS WITH KEY ROTATION
         ----------------------------------------- */
 
-        const generated =
-          await callGemini(
-            imageFile,
-            promptType,
-            promptDetail
-          );
-
-        /* -----------------------------------------
-           SAVE RESULT
-        ----------------------------------------- */
+        const generated = await generatePromptWithProvider(
+          String(settings.provider || "gemini") as "auto" | "gemini" | "openai" | "claude" | "grok",
+          imageFile,
+          promptType,
+          promptDetail
+        );
 
         results.push({
-          fileName:
-            originalFile.name,
-
-          prompt:
-            generated.prompt,
-
-          provider:
-            "Gemini",
-
-          model:
-            generated.model,
+          fileName: originalFile.name,
+          prompt: generated.prompt,
+          provider: generated.provider,
+          model: generated.model,
         });
 
       } catch (error) {

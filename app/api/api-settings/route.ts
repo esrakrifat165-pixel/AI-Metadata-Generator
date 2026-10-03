@@ -1,291 +1,145 @@
 import { NextResponse } from "next/server";
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 
 export const runtime = "nodejs";
 
-type ApiProvider = "gemini" | "openai" | "claude" | "grok";
+type Provider = "gemini" | "openai" | "claude" | "grok";
 
-const CONFIG: Record<
-  ApiProvider,
-  {
-    env: string;
-    label: string;
-  }
-> = {
-  gemini: {
-    env: "GEMINI_API_KEY",
-    label: "Gemini",
-  },
-  openai: {
-    env: "OPENAI_API_KEY",
-    label: "OpenAI / ChatGPT",
-  },
-  claude: {
-    env: "ANTHROPIC_API_KEY",
-    label: "Claude",
-  },
-  grok: {
-    env: "XAI_API_KEY",
-    label: "Grok",
-  },
+const PROVIDERS: Record<Provider, { prefix: string; label: string; key1: string }> = {
+  gemini: { prefix: "GEMINI_API_KEY", label: "Gemini", key1: "GEMINI_API_KEY" },
+  openai: { prefix: "OPENAI_API_KEY", label: "OpenAI / ChatGPT", key1: "OPENAI_API_KEY_1" },
+  claude: { prefix: "ANTHROPIC_API_KEY", label: "Claude", key1: "ANTHROPIC_API_KEY_1" },
+  grok: { prefix: "XAI_API_KEY", label: "Grok", key1: "XAI_API_KEY_1" },
 };
 
-function isProvider(value: unknown): value is ApiProvider {
-  return (
-    value === "gemini" ||
-    value === "openai" ||
-    value === "claude" ||
-    value === "grok"
-  );
+function getEnvName(provider: Provider, index: number) {
+  const config = PROVIDERS[provider];
+  if (index === 1) return config.key1;
+  return `${config.prefix}_${index}`;
 }
 
-function envPath() {
+function getEnvPath() {
   return path.join(process.cwd(), ".env.local");
 }
 
-function readEnv() {
-  const file = envPath();
-
-  if (!fs.existsSync(file)) {
-    return "";
-  }
-
-  return fs.readFileSync(file, "utf8");
+function maskKey(value: string) {
+  if (!value) return "";
+  if (value.length <= 8) return "••••••••";
+  return `${value.slice(0, 4)}••••••••${value.slice(-4)}`;
 }
 
-function escapeRegex(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function readEnvFile() {
+  const filePath = getEnvPath();
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
 
-function setEnvValue(
-  content: string,
-  key: string,
-  value: string
-) {
-  const regex = new RegExp(
-    `^${escapeRegex(key)}=.*$`,
+function writeEnvValue(source: string, envName: string, value: string) {
+  const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  const line = `${envName}="${escaped}"`;
+  const pattern = new RegExp(
+    `^\\s*${envName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\s*=.*$`,
     "m"
   );
 
-  const line = `${key}=${value}`;
+  if (pattern.test(source)) return source.replace(pattern, line);
 
-  if (regex.test(content)) {
-    return content.replace(regex, line);
-  }
-
-  const separator =
-    content.length && !content.endsWith("\n")
-      ? "\n"
-      : "";
-
-  return `${content}${separator}${line}\n`;
+  const separator = source.length && !source.endsWith("\n") ? "\n" : "";
+  return `${source}${separator}${line}\n`;
 }
 
-function removeEnvValue(
-  content: string,
-  key: string
-) {
-  const regex = new RegExp(
-    `^${escapeRegex(key)}=.*\\r?\\n?`,
+function removeEnvValue(source: string, envName: string) {
+  const pattern = new RegExp(
+    `^\\s*${envName.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")}\\s*=.*(?:\\r?\\n|$)`,
     "m"
   );
-
-  return content.replace(regex, "");
+  return source.replace(pattern, "");
 }
 
-function maskKey(key: string) {
-  if (!key) return "";
-
-  if (key.length <= 8) {
-    return "••••••••";
-  }
-
-  return `${key.slice(0, 4)}••••••••${key.slice(-4)}`;
-}
-
-function configured() {
-  return {
-    gemini: Boolean(
-      process.env.GEMINI_API_KEY?.trim()
-    ),
-    openai: Boolean(
-      process.env.OPENAI_API_KEY?.trim()
-    ),
-    claude: Boolean(
-      process.env.ANTHROPIC_API_KEY?.trim()
-    ),
-    grok: Boolean(
-      process.env.XAI_API_KEY?.trim()
-    ),
+function getKeys() {
+  const result: Record<Provider, Array<{ index: number; label: string; maskedKey: string }>> = {
+    gemini: [],
+    openai: [],
+    claude: [],
+    grok: [],
   };
+
+  (Object.keys(PROVIDERS) as Provider[]).forEach((provider) => {
+    for (let index = 1; index <= 10; index++) {
+      const envName = getEnvName(provider, index);
+      const value = process.env[envName]?.trim() || "";
+      if (!value) continue;
+      result[provider].push({
+        index,
+        label: `${PROVIDERS[provider].label} Key ${index}`,
+        maskedKey: maskKey(value),
+      });
+    }
+  });
+
+  return result;
 }
 
 export async function GET() {
-  try {
-    const status = configured();
-
-    return NextResponse.json({
-      success: true,
-      configured: status,
-      masked: {
-        gemini: status.gemini
-          ? maskKey(
-              process.env.GEMINI_API_KEY || ""
-            )
-          : "",
-        openai: status.openai
-          ? maskKey(
-              process.env.OPENAI_API_KEY || ""
-            )
-          : "",
-        claude: status.claude
-          ? maskKey(
-              process.env.ANTHROPIC_API_KEY || ""
-            )
-          : "",
-        grok: status.grok
-          ? maskKey(
-              process.env.XAI_API_KEY || ""
-            )
-          : "",
-      },
-    });
-  } catch (error) {
-    console.error(error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        message: "Could not load API settings.",
-      },
-      { status: 500 }
-    );
-  }
+  return NextResponse.json({ success: true, keys: getKeys() });
 }
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
+    const provider = body?.provider as Provider;
+    const index = Number(body?.index);
+    const apiKey = typeof body?.apiKey === "string" ? body.apiKey.trim() : "";
 
-    const provider = body?.provider;
-    const apiKey = String(
-      body?.apiKey || ""
-    ).trim();
-
-    if (!isProvider(provider)) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Invalid API provider.",
-        },
-        { status: 400 }
-      );
+    if (!PROVIDERS[provider] || !Number.isInteger(index) || index < 1 || index > 10) {
+      return NextResponse.json({ success: false, message: "Invalid provider or key number." }, { status: 400 });
     }
 
-    if (!apiKey) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Please enter an API key.",
-        },
-        { status: 400 }
-      );
+    if (!apiKey || apiKey.length < 8) {
+      return NextResponse.json({ success: false, message: "Please enter a valid API key." }, { status: 400 });
     }
 
-    const config = CONFIG[provider];
-
-    let content = readEnv();
-
-    content = setEnvValue(
-      content,
-      config.env,
-      apiKey
-    );
-
-    fs.writeFileSync(
-      envPath(),
-      content,
-      "utf8"
-    );
-
-    process.env[config.env] = apiKey;
+    const envName = getEnvName(provider, index);
+    const updated = writeEnvValue(readEnvFile(), envName, apiKey);
+    fs.writeFileSync(getEnvPath(), updated, "utf8");
+    process.env[envName] = apiKey;
 
     return NextResponse.json({
       success: true,
       provider,
-      label: config.label,
-      configured: true,
+      index,
       key: maskKey(apiKey),
-      message: `${config.label} API key saved successfully.`,
+      message: `${PROVIDERS[provider].label} Key ${index} saved successfully.`,
     });
   } catch (error) {
-    console.error(error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : "Could not save API key.",
-      },
-      { status: 500 }
-    );
+    console.error("API settings save error:", error);
+    return NextResponse.json({ success: false, message: error instanceof Error ? error.message : "Could not save API key." }, { status: 500 });
   }
 }
 
 export async function DELETE(req: Request) {
   try {
     const body = await req.json();
+    const provider = body?.provider as Provider;
+    const index = Number(body?.index);
 
-    const provider = body?.provider;
-
-    if (!isProvider(provider)) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Invalid API provider.",
-        },
-        { status: 400 }
-      );
+    if (!PROVIDERS[provider] || !Number.isInteger(index) || index < 1 || index > 10) {
+      return NextResponse.json({ success: false, message: "Invalid provider or key number." }, { status: 400 });
     }
 
-    const config = CONFIG[provider];
-
-    let content = readEnv();
-
-    content = removeEnvValue(
-      content,
-      config.env
-    );
-
-    fs.writeFileSync(
-      envPath(),
-      content,
-      "utf8"
-    );
-
-    delete process.env[config.env];
+    const envName = getEnvName(provider, index);
+    const updated = removeEnvValue(readEnvFile(), envName);
+    fs.writeFileSync(getEnvPath(), updated, "utf8");
+    delete process.env[envName];
 
     return NextResponse.json({
       success: true,
       provider,
-      configured: false,
-      message: `${config.label} API key removed successfully.`,
+      index,
+      message: `${PROVIDERS[provider].label} Key ${index} removed successfully.`,
     });
   } catch (error) {
-    console.error(error);
-
-    return NextResponse.json(
-      {
-        success: false,
-        message:
-          error instanceof Error
-            ? error.message
-            : "Could not remove API key.",
-      },
-      { status: 500 }
-    );
+    console.error("API settings remove error:", error);
+    return NextResponse.json({ success: false, message: error instanceof Error ? error.message : "Could not remove API key." }, { status: 500 });
   }
 }
