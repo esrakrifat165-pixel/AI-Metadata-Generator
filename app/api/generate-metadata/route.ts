@@ -16,7 +16,7 @@ type Provider =
   | "gemini"
   | "openai"
   | "claude"
-  | "grok";
+  | "groq";
 
 type ImageInput = {
   name: string;
@@ -805,111 +805,74 @@ async function callClaude(
    GROK
 ========================================================= */
 
-async function callGrok(
+async function callGroq(
   apiKey: string,
   model: string,
   prompt: string,
   file: ImageInput
 ): Promise<Metadata> {
   const response = await fetch(
-    "https://api.x.ai/v1/responses",
+    "https://api.groq.com/openai/v1/chat/completions",
     {
       method: "POST",
-
       headers: {
-        "Content-Type":
-          "application/json",
-
-        Authorization:
-          `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
       },
-
       body: JSON.stringify({
         model,
-
-        input: [
+        messages: [
           {
             role: "user",
-
             content: [
               {
-                type:
-                  "input_image",
-
-                image_url:
-                  `data:${
-                    file.type ||
-                    "image/jpeg"
-                  };base64,${file.data}`,
+                type: "text",
+                text: prompt,
               },
-
               {
-                type:
-                  "input_text",
-
-                text:
-                  prompt,
+                type: "image_url",
+                image_url: {
+                  url: `data:${file.type || "image/jpeg"};base64,${file.data}`,
+                },
               },
             ],
           },
         ],
+        temperature: 0,
+        response_format: { type: "json_object" },
       }),
     }
   );
 
-  const responseText =
-    await response.text();
+  const responseText = await response.text();
 
   if (!response.ok) {
-    let message =
-      responseText;
-
+    let message = responseText;
     try {
-      const errorData =
-        JSON.parse(
-          responseText
-        );
-
-      message =
-        errorData?.error?.message ||
-        responseText;
+      const errorData = JSON.parse(responseText);
+      message = errorData?.error?.message || responseText;
     } catch {}
-
-    throw new Error(
-      `Grok ${response.status}: ${message}`
-    );
+    throw new Error(`Groq ${response.status}: ${message}`);
   }
 
   let data: any;
-
   try {
-    data =
-      JSON.parse(
-        responseText
-      );
+    data = JSON.parse(responseText);
   } catch {
-    throw new Error(
-      "Grok returned invalid JSON."
-    );
+    throw new Error("Groq returned invalid JSON.");
   }
 
-  const generated =
-    data?.output_text;
+  const generated = data?.choices?.[0]?.message?.content;
 
   if (!generated) {
-    throw new Error(
-      "Grok returned no metadata."
-    );
+    throw new Error("Groq returned no metadata.");
   }
 
-  const metadata =
-    parseJSON(
-      generated
-    );
+  const metadata = parseJSON(generated);
 
   return {
     ...metadata,
-    provider: "Grok",
+    provider: "Groq",
     model,
   };
 }
@@ -938,8 +901,8 @@ async function generate(
     Claude:
       ANTHROPIC_API_KEY_1 ... ANTHROPIC_API_KEY_10
 
-    Grok:
-      XAI_API_KEY_1 ... XAI_API_KEY_10
+    Groq:
+      GROQ_API_KEY_1 ... GROQ_API_KEY_10
 
     If the current key fails, the next configured key is tried.
   */
@@ -1135,20 +1098,20 @@ async function generate(
 
   /* ---------------- GROK ---------------- */
 
-  if (provider === "grok") {
+  if (provider === "groq") {
     const model =
-      process.env.XAI_MODEL ||
-      "grok-4.6";
+      process.env.GROQ_MODEL ||
+      "qwen/qwen3.8-27b";
 
-    let lastError = "All Grok API keys failed.";
+    let lastError = "All Groq API keys failed.";
 
     for (const keyInfo of candidates) {
       try {
         console.log(
-          `Trying Grok Key ${keyInfo.index}...`
+          `Trying Groq Key ${keyInfo.index}...`
         );
 
-        const result = await callGrok(
+        const result = await callGroq(
           keyInfo.key,
           model,
           prompt,
@@ -1156,7 +1119,7 @@ async function generate(
         );
 
         console.log(
-          `Grok success: Key ${keyInfo.index}`
+          `Groq success: Key ${keyInfo.index}`
         );
 
         return result;
@@ -1164,21 +1127,21 @@ async function generate(
         lastError =
           error instanceof Error
             ? error.message
-            : "Unknown Grok error.";
+            : "Unknown Groq error.";
 
         console.error(
-          `Grok Key ${keyInfo.index} failed:`,
+          `Groq Key ${keyInfo.index} failed:`,
           lastError
         );
 
         console.log(
-          `Trying next Grok key...`
+          `Trying next Groq key...`
         );
       }
     }
 
     throw new Error(
-      `All configured Grok API keys failed. Last error: ${lastError}`
+      `All configured Groq API keys failed. Last error: ${lastError}`
     );
   }
 
@@ -1199,7 +1162,7 @@ async function autoGenerate(
     "gemini",
     "openai",
     "claude",
-    "grok",
+    "groq",
   ];
 
   let lastError =
