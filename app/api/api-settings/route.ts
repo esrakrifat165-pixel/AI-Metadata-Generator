@@ -1,37 +1,26 @@
 import { NextResponse } from "next/server";
-import fs from "node:fs";
-import path from "node:path";
 
 export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
-type Provider =
-  | "gemini"
-  | "openai"
-  | "claude"
-  | "groq";
+type Provider = "gemini" | "openai" | "claude" | "groq";
 
 const PROVIDERS: Record<
   Provider,
-  {
-    prefix: string;
-    label: string;
-  }
+  { prefix: string; label: string }
 > = {
   gemini: {
     prefix: "GEMINI_API_KEY",
     label: "Gemini",
   },
-
   openai: {
     prefix: "OPENAI_API_KEY",
     label: "OpenAI / ChatGPT",
   },
-
   claude: {
     prefix: "ANTHROPIC_API_KEY",
     label: "Claude",
   },
-
   groq: {
     prefix: "GROQ_API_KEY",
     label: "Groq",
@@ -40,17 +29,7 @@ const PROVIDERS: Record<
 
 const MAX_KEYS = 10;
 
-function getEnvPath() {
-  return path.join(
-    process.cwd(),
-    ".env.local"
-  );
-}
-
-function getEnvName(
-  provider: Provider,
-  index: number
-) {
+function getEnvName(provider: Provider, index: number) {
   return index === 1
     ? PROVIDERS[provider].prefix
     : `${PROVIDERS[provider].prefix}_${index}`;
@@ -63,226 +42,96 @@ function maskKey(value: string) {
     return "••••••••";
   }
 
-  return `${value.slice(
-    0,
-    4
-  )}••••••••${value.slice(-4)}`;
+  return `${value.slice(0, 4)}••••••••${value.slice(-4)}`;
 }
 
-function readEnvFile() {
-  const filePath = getEnvPath();
+function getProviderState(provider: Provider) {
+  return Array.from({ length: MAX_KEYS }, (_, i) => {
+    const index = i + 1;
 
-  return fs.existsSync(filePath)
-    ? fs.readFileSync(
-        filePath,
-        "utf8"
-      )
-    : "";
+    const key =
+      process.env[getEnvName(provider, index)]?.trim() || "";
+
+    return {
+      index,
+      configured: Boolean(key),
+      maskedKey: maskKey(key),
+    };
+  });
 }
 
-function escapeRegExp(
-  value: string
-) {
-  return value.replace(
-    /[.*+?^${}()|[\]\\]/g,
-    "\\$&"
-  );
-}
+/* =========================
+   GET API KEY STATUS
+========================= */
 
-function writeEnvValue(
-  source: string,
-  envName: string,
-  value: string
-) {
-  const escapedValue =
-    value
-      .replace(/\\/g, "\\\\")
-      .replace(/"/g, '\\"');
+export async function GET() {
+  const providers = (
+    Object.keys(PROVIDERS) as Provider[]
+  ).reduce(
+    (result, provider) => {
+      const keys = getProviderState(provider);
 
-  const line =
-    `${envName}="${escapedValue}"`;
-
-  const pattern =
-    new RegExp(
-      `^\\s*${escapeRegExp(
-        envName
-      )}\\s*=.*$`,
-      "m"
-    );
-
-  if (pattern.test(source)) {
-    return source.replace(
-      pattern,
-      line
-    );
-  }
-
-  const separator =
-    source.length &&
-    !source.endsWith("\n")
-      ? "\n"
-      : "";
-
-  return `${source}${separator}${line}\n`;
-}
-
-function removeEnvValue(
-  source: string,
-  envName: string
-) {
-  const pattern =
-    new RegExp(
-      `^\\s*${escapeRegExp(
-        envName
-      )}\\s*=.*(?:\\r?\\n|$)`,
-      "m"
-    );
-
-  return source.replace(
-    pattern,
-    ""
-  );
-}
-
-function getProviderState(
-  provider: Provider
-) {
-  return Array.from(
-    {
-      length: MAX_KEYS,
-    },
-    (_, i) => {
-      const index = i + 1;
-
-      const envName =
-        getEnvName(
-          provider,
-          index
-        );
-
-      const key =
-        process.env[
-          envName
-        ]?.trim() || "";
-
-      return {
-        index,
-        configured: Boolean(key),
-        maskedKey:
-          maskKey(key),
+      result[provider] = {
+        label: PROVIDERS[provider].label,
+        configuredCount: keys.filter(
+          (item) => item.configured
+        ).length,
+        keys,
       };
+
+      return result;
+    },
+    {} as Record<
+      Provider,
+      {
+        label: string;
+        configuredCount: number;
+        keys: ReturnType<typeof getProviderState>;
+      }
+    >
+  );
+
+  return NextResponse.json(
+    {
+      success: true,
+      providers,
+      message:
+        "API keys are managed through server environment variables. On Vercel, add them in Project Settings → Environment Variables.",
+    },
+    {
+      headers: {
+        "Cache-Control": "no-store, max-age=0",
+      },
     }
   );
 }
 
-export async function GET() {
-  const providers =
-    (
-      Object.keys(
-        PROVIDERS
-      ) as Provider[]
-    ).reduce(
-      (acc, provider) => {
-        acc[provider] = {
-          label:
-            PROVIDERS[
-              provider
-            ].label,
+/* =========================
+   POST
+========================= */
 
-          keys:
-            getProviderState(
-              provider
-            ),
-        };
-
-        return acc;
-      },
-      {} as Record<
-        Provider,
-        {
-          label: string;
-          keys: ReturnType<
-            typeof getProviderState
-          >;
-        }
-      >
-    );
-
-  const keys =
-    (
-      Object.keys(
-        PROVIDERS
-      ) as Provider[]
-    ).reduce(
-      (acc, provider) => {
-        acc[provider] =
-          getProviderState(
-            provider
-          ).filter(
-            (item) =>
-              item.configured
-          );
-
-        return acc;
-      },
-      {} as Record<
-        Provider,
-        ReturnType<
-          typeof getProviderState
-        >
-      >
-    );
-
-  return NextResponse.json({
-    success: true,
-    keys,
-    providers,
-  });
-}
-
-export async function POST(
-  req: Request
-) {
+export async function POST(req: Request) {
   try {
-    const body =
-      await req.json();
+    const body = await req.json().catch(() => ({}));
 
-    const provider =
-      body?.provider as Provider;
+    const provider = body?.provider as Provider;
 
     const keyIndex = Number(
-      body?.index ??
-        body?.keyIndex ??
-        1
+      body?.index ?? body?.keyIndex ?? 1
     );
-
-    const apiKey =
-      typeof body?.apiKey ===
-      "string"
-        ? body.apiKey.trim()
-        : "";
-
-    const action =
-      body?.action ===
-      "remove"
-        ? "remove"
-        : "save";
 
     if (!PROVIDERS[provider]) {
       return NextResponse.json(
         {
           success: false,
-          message:
-            "Invalid API provider.",
+          message: "Invalid API provider.",
         },
         { status: 400 }
       );
     }
 
     if (
-      !Number.isInteger(
-        keyIndex
-      ) ||
+      !Number.isInteger(keyIndex) ||
       keyIndex < 1 ||
       keyIndex > MAX_KEYS
     ) {
@@ -296,81 +145,19 @@ export async function POST(
       );
     }
 
-    const envName =
-      getEnvName(
-        provider,
-        keyIndex
-      );
-
-    let current =
-      readEnvFile();
-
-    if (action === "remove") {
-      current =
-        removeEnvValue(
-          current,
-          envName
-        );
-
-      fs.writeFileSync(
-        getEnvPath(),
-        current,
-        "utf8"
-      );
-
-      delete process.env[
-        envName
-      ];
-
-      return NextResponse.json({
-        success: true,
+    return NextResponse.json(
+      {
+        success: false,
+        code: "ENVIRONMENT_VARIABLES_REQUIRED",
         message:
-          `${PROVIDERS[provider].label} Key ${keyIndex} removed.`,
-      });
-    }
-
-    if (
-      !apiKey ||
-      apiKey.length < 8
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          message:
-            "Please enter a valid API key.",
-        },
-        { status: 400 }
-      );
-    }
-
-    current =
-      writeEnvValue(
-        current,
-        envName,
-        apiKey
-      );
-
-    fs.writeFileSync(
-      getEnvPath(),
-      current,
-      "utf8"
+          `${PROVIDERS[provider].label} Key ${keyIndex} cannot be saved from the live website. ` +
+          "Add it in Vercel Project Settings → Environment Variables, then redeploy.",
+        envName: getEnvName(provider, keyIndex),
+      },
+      { status: 409 }
     );
-
-    process.env[envName] =
-      apiKey;
-
-    return NextResponse.json({
-      success: true,
-      index: keyIndex,
-      key: maskKey(apiKey),
-      message:
-        `${PROVIDERS[provider].label} Key ${keyIndex} saved securely on the server.`,
-    });
   } catch (error) {
-    console.error(
-      "API settings error:",
-      error
-    );
+    console.error("API settings POST error:", error);
 
     return NextResponse.json(
       {
@@ -378,79 +165,73 @@ export async function POST(
         message:
           error instanceof Error
             ? error.message
-            : "Could not update API key.",
+            : "Could not process API key settings.",
       },
       { status: 500 }
     );
   }
 }
 
-export async function DELETE(
-  req: Request
-) {
+/* =========================
+   DELETE
+========================= */
+
+export async function DELETE(req: Request) {
   try {
-    const body =
-      await req.json();
+    const body = await req.json().catch(() => ({}));
 
-    const provider =
-      body?.provider as Provider;
+    const provider = body?.provider as Provider;
 
-    const index = Number(
-      body?.index ??
-        body?.keyIndex
+    const keyIndex = Number(
+      body?.index ?? body?.keyIndex ?? 1
     );
 
-    if (
-      !PROVIDERS[provider] ||
-      !Number.isInteger(index) ||
-      index < 1 ||
-      index > MAX_KEYS
-    ) {
+    if (!PROVIDERS[provider]) {
       return NextResponse.json(
         {
           success: false,
-          message:
-            "Invalid provider or key number.",
+          message: "Invalid API provider.",
         },
         { status: 400 }
       );
     }
 
-    const envName =
-      getEnvName(
-        provider,
-        index
+    if (
+      !Number.isInteger(keyIndex) ||
+      keyIndex < 1 ||
+      keyIndex > MAX_KEYS
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "API key number must be between 1 and 10.",
+        },
+        { status: 400 }
       );
+    }
 
-    const current =
-      removeEnvValue(
-        readEnvFile(),
-        envName
-      );
-
-    fs.writeFileSync(
-      getEnvPath(),
-      current,
-      "utf8"
+    return NextResponse.json(
+      {
+        success: false,
+        code: "ENVIRONMENT_VARIABLES_REQUIRED",
+        message:
+          `${PROVIDERS[provider].label} Key ${keyIndex} cannot be removed from the live website. ` +
+          "Remove the corresponding environment variable from Vercel Project Settings → Environment Variables, then redeploy.",
+        envName: getEnvName(provider, keyIndex),
+      },
+      { status: 409 }
     );
-
-    delete process.env[
-      envName
-    ];
-
-    return NextResponse.json({
-      success: true,
-      message:
-        `${PROVIDERS[provider].label} Key ${index} removed.`,
-    });
   } catch (error) {
+    console.error("API settings DELETE error:", error);
+
     return NextResponse.json(
       {
         success: false,
         message:
           error instanceof Error
             ? error.message
-            : "Could not remove API key.",
+            : "Could not process API key removal.",
       },
       { status: 500 }
     );
