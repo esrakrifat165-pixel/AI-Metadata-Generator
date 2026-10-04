@@ -1431,7 +1431,7 @@ export default function Home() {
           })
         );
 
-        setApiKeys(normalized);
+        setApiKeys(normalized as typeof apiKeys);
       } else {
         setApiKeys(data.keys || {});
       }
